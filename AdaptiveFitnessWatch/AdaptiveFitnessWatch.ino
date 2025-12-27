@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include "MAX30105.h"
 #include "heartRate.h"
+#include "secrets.h"
 
 //--TinyML requirements---
 #include "rpe_model_quant.h"
@@ -107,8 +108,6 @@ bool restJustStarted = true;
 #define MAX_STEP_SPIKE 4.0       // reject deltaX greater than 4× threshold
 #define DISPLAY_REFRESH_MS 250   // OLED refresh every 250ms
 
-const char* ssid = "Nidish’s iPhone";
-const char* password = "helloman";
 WebServer server(80);
 
 #define OLED_RESET -1
