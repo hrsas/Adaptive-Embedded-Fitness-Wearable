@@ -1,4 +1,4 @@
 #pragma once
 
-const char* ssid = "Nidish’s iPhone";
-const char* password = "helloman";
+const char* ssid = "..."; //your ssid
+const char* password = "..."; //your wifi password
