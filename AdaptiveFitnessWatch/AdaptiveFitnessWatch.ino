@@ -6,6 +6,84 @@
 #include "MAX30105.h"
 #include "heartRate.h"
 
+//--TinyML requirements---
+#include "rpe_model_quant.h"
+#include <tflm_esp32.h>
+#include <eloquent_tinyml.h>
+
+#define NUM_INPUTS 7
+#define NUM_OUTPUTS 1
+#define ARENA_SIZE 60000
+#define NUMBER_OF_OPS 50
+
+Eloquent::TF::Sequential<NUMBER_OF_OPS, ARENA_SIZE> tf;
+
+const float scaler_mean[NUM_INPUTS] = {
+  130.7151, 143.1066, 115.2316,
+  25.2831, -0.9292, 3.7733, 0.2201
+};
+
+const float scaler_std[NUM_INPUTS] = {
+  16.5989, 16.1716, 20.5403,
+  6.9640, 0.2520, 1.2911, 0.0762
+};
+
+
+struct RPEFeatures {
+  float avg_bpm;
+  float peak_bpm;
+  float min_bpm_rest;
+  float hr_recovery_30s;
+  float recovery_slope;
+  float hr_variability;
+  float session_load_index;
+};
+
+RPEFeatures rpeFeatures;
+
+float bpmSum = 0;
+int bpmSamples = 0;
+float hrVarSum = 0;
+int hrVarSamples = 0;
+float prevHRForVar = -1;
+bool restBaselineCaptured = false;
+bool recoveryCaptured = false;
+
+
+//----------------------end of TinyML requiremtns
+
+
+/**************** HEART RATE MODULE ****************/
+
+// ---- Sensor ----
+MAX30105 hrSensor;
+
+// ---- Beat detection (SparkFun) ----
+const byte HR_RATE_SIZE = 4;
+byte hrRates[HR_RATE_SIZE];
+byte hrRateSpot = 0;
+
+long hrLastBeat = 0;
+float hrBPMInstant = 0;
+int hrBPMAvg = 0;
+
+// ---- RR + confidence ----
+#define HR_RR_BUF 6
+unsigned long hrRR[HR_RR_BUF];
+byte hrRRIndex = 0;
+bool hrRRFilled = false;
+
+// ---- Gated BPM ----
+int hrBPMUsed = 0;
+int hrLastGoodBPM = 60;
+float hrBPMTrend = 0;
+
+// ---- Confidence ----
+int hrConfidence = 0;
+
+//---------------------------------------------
+
+
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define TOUCH_PIN 4  // D4 touch sensor
@@ -17,6 +95,7 @@ int stepsInWindow = 0;          // adaptive tuning counter
 unsigned long lastDisplayUpdate = 0; // OLED refresh timer
 unsigned long setStartTime = 0;
 float targetPeakHR = 130.0f;  // default moderate effort
+int peakWorkoutHR = 0;
 float lastSetRPE = 0;   // latest RPE value for display/log
 // --- Heart rate recovery state ---
 unsigned long restStart = 0;
@@ -28,15 +107,14 @@ bool restJustStarted = true;
 #define MAX_STEP_SPIKE 4.0       // reject deltaX greater than 4× threshold
 #define DISPLAY_REFRESH_MS 250   // OLED refresh every 250ms
 
-const char* ssid = "Harsha's Realme";
-const char* password = "hahahehe";
+const char* ssid = "Nidish’s iPhone";
+const char* password = "helloman";
 WebServer server(80);
 
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 Adafruit_MPU6050 mpu;
-MAX30105 particleSensor;
 
 // --- Gyroscope baseline bias ---
 float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
@@ -113,26 +191,6 @@ unsigned long buttonPressStartTime = 0;
 bool buttonHeldDown = false;
 const unsigned long RESTART_HOLD_TIME = 5000; //Time to restart
 
-long lastBeat = 0;
-float bpm = 0;
-float bpmFiltered = 0;
-float instantBPM = 0;
-
-//Heart rate sensor variables
-#define MAX_HISTORY 5   // number of beats used for averaging
-float beatHistory[MAX_HISTORY];
-int beatIndex = 0;
-bool historyFull = false;
-int beatsCollected = 0;
-int peakWorkoutHR = 0;
-
-// --- Tunables to avoid spikes / false detections ---
-const unsigned long MIN_BEAT_INTERVAL_MS = 480; // ignore beats closer than ~480 ms (~125 BPM)
-const long MIN_IR = 15000;    // ignore beats if IR is below this (weak contact)
-const long MAX_IR = 130000;   // ignore if IR is above this (saturation)
-const float MAX_PERCENT_JUMP = 0.30; // reject instantBPM jumps >30%
-const int MIN_BEATS_FOR_DISPLAY = 3; // wait for some beats before trusting display
-
 float filtX = 0, filtY = 0, filtZ = 0;
 const float FILTER_ALPHA = 0.15;  // low-pass smoothing
 const float MIN_AMPLITUDE = 0.4;  // ignore tiny tremors
@@ -192,6 +250,10 @@ void toggleWorkoutMode();
 void displayWaitingScreen();
 void handleRoot();
 void handleSubmit();
+void HR_Init();
+void HR_Update();
+int HR_GetBPM();
+int HR_GetConfidence();
 
 void setup() {
   Serial.begin(9600);
@@ -199,6 +261,7 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW); // off initially
 
+  HR_Init(); //init heart rate sensor
 
   // Initialize MPU6050
   if (!mpu.begin()) {
@@ -211,23 +274,6 @@ void setup() {
     Serial.println("OLED init failed!");
     while (1);
   }
-
-  //Init Heart rate sensor
-  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    display.clearDisplay();
-    display.setCursor(0, 10);
-    display.println("MAX30102 not found!");
-    display.display();
-    while (1);
-  }
-
-  particleSensor.setup();
-  particleSensor.setPulseAmplitudeRed(0x7F);   // Moderate LED drive
-  particleSensor.setPulseAmplitudeIR(0x7F);
-  particleSensor.setADCRange(4096);            // High sensitivity
-  particleSensor.setPulseWidth(411);
-  particleSensor.setSampleRate(50);
-  particleSensor.setPulseAmplitudeGreen(0);    // Disable green LED
 
   display.clearDisplay();
   display.setTextSize(1);
@@ -261,6 +307,19 @@ void setup() {
   
   // Start in configuration mode
   workoutState = CONFIGURING;
+
+    // ===== ML MODEL INIT =====
+  tf.setNumInputs(NUM_INPUTS);
+  tf.setNumOutputs(NUM_OUTPUTS);
+
+  tf.resolver.AddFullyConnected();
+
+  while (!tf.begin(rpe_model).isOk()) {
+    Serial.println(tf.exception.toString());
+    delay(1000);
+  }
+
+  Serial.println("✅ RPE ML model loaded");
 }
 
 void loop() {
@@ -268,7 +327,7 @@ void loop() {
   
   // Handle button press to toggle between workout and step counting
   handleTouchInput();
-  readHeartRate();
+  HR_Update();
   // Handle the current state
   switch(workoutState) {
     case CONFIGURING:
@@ -301,128 +360,6 @@ void buzz(int freq = 2700, int duration = 120, int repeats = 1, int gap = 100) {
     delay(duration);
     noTone(BUZZER_PIN);         // stop tone
     if (i < repeats - 1) delay(gap);
-  }
-}
-
-// Uses: workoutState, currentRep, currentSet, stepCount, peakWorkoutHR, bpmFiltered
-void readHeartRate() {
-  static unsigned long lastUpdate = 0;
-  static float fakeBPM = 72.0f;         // current simulated instantaneous BPM
-  static float smoothBPM = 72.0f;       // smoothed output -> bpmFiltered
-  static float repPulse = 0.0f;         // temporary bump from a rep
-  static int lastRepSeen = 0;           // to detect new reps
-  static unsigned long lastRepTime = 0;
-  static float workoutIntensity = 0.0f; // 0..1 indicates how intense the session is
-  const unsigned long UPDATE_MS = 300;  // update rate (300ms)
-
-  unsigned long now = millis();
-  if (now - lastUpdate < UPDATE_MS) return;
-  lastUpdate = now;
-
-  // --- Baseline values by mode ---
-  float walkingBase = 64.0f + 6.0f * sin(now / 5000.0f); // 58–70 gentle oscillation
-  float idleBase    = 68.0f + 4.0f * sin(now / 6000.0f); // relaxed baseline
-
-  // Detect if there was a new rep
-  bool newRep = (currentRep != lastRepSeen);
-  if (newRep) {
-    lastRepSeen = currentRep;
-    lastRepTime = now;
-  }
-
-  // --- WORKOUT intensity buildup ---
-  if (workoutState == WORKING) {
-    float effortBoost = (lastSetRPE - 6.0f) * 1.5f; // higher RPE = higher base HR
-    float base = 75.0f + 40.0f * workoutIntensity + effortBoost;
-
-    float targetIntensity = 0.4f + 0.6f * (float(currentSet - 1) / max(1, workout[currentExerciseIndex].sets - 1));
-    targetIntensity = constrain(targetIntensity, 0.4f, 1.0f);
-    workoutIntensity = workoutIntensity * 0.88f + targetIntensity * 0.12f;
-
-    fakeBPM = base + 8.0f * sin(now / 2000.0f) + (random(-6,7) * 0.7f);
-
-    // rep pulse bumps
-    if (newRep) {
-      float bump = 6.0f + 30.0f * workoutIntensity * (0.6f + random(0,40)/100.0f);
-      repPulse += bump;
-    }
-
-    // occasional effort spike
-    if (random(0, 100) < 10) {
-      float spike = 10.0f + random(0, 40) * workoutIntensity;
-      repPulse += spike;
-    }
-
-    fakeBPM += repPulse;
-    repPulse *= 0.75f;
-  }
-
-  // --- RESTING (gradual decay) ---
-  else if (workoutState == RESTING) {
-  // --- Establish a baseline (~70–100 bpm depending on last peak) ---
-    float restBaseline = max(80.0f, float(peakWorkoutHR) * 0.7f);
-
-    // --- Track elapsed recovery time (since last rep/set ended) ---
-    if (restJustStarted) {
-      restJustStarted = false;
-      restStart = millis();
-      restStartHR = fakeBPM;  // starting HR (peak at end of set)
-    }
-
-    // --- Compute how far into recovery we are ---
-    unsigned long elapsed = millis() - restStart;
-    float t = constrain(elapsed / 8000.0f, 0.0f, 1.0f); // 0→1 over ~8s total duration
-
-    // --- Use smooth non-linear interpolation for realism ---
-    // Slow at start, faster mid, slows near baseline (sigmoid-style curve)
-    float smoothT = t * t * (3 - 2 * t);
-
-    // --- Blend from starting HR toward baseline over time ---
-    float targetHR = restStartHR - (restStartHR - restBaseline) * smoothT;
-
-    // --- Add slight random & sinusoidal fluctuations (±1–2 bpm) ---
-    float microJitter = sin(millis() / 900.0f) * 1.2f + (random(-8, 9) * 0.15f);
-
-    // --- Combine ---
-    fakeBPM = 0.9f * fakeBPM + 0.1f * (targetHR + microJitter);
-
-    // --- Reset restJustStarted when leaving rest state ---
-    if (workoutState != RESTING) {
-      restJustStarted = true;
-    }
-  }
-
-  // --- STEP COUNTING (light walking) ---
-  else if (workoutState == STEP_COUNTING) {
-    float wander = 3.0f * sin(now / 3000.0f) + (random(-8,9) * 0.15f);
-    fakeBPM = walkingBase + wander;
-  }
-
-  // --- Idle / Other states ---
-  else {
-    workoutIntensity *= 0.85f;
-    fakeBPM = idleBase + (random(-4,5) * 0.5f);
-  }
-
-  // --- Clamp & filter ---
-  fakeBPM = constrain(fakeBPM, 45.0f, 200.0f);
-  if ((int)fakeBPM > peakWorkoutHR && workoutState == WORKING)
-    peakWorkoutHR = (int)fakeBPM;
-
-  if (bpmFiltered <= 0.1f) bpmFiltered = fakeBPM;
-  else bpmFiltered = 0.92f * bpmFiltered + 0.08f * fakeBPM;
-
-  instantBPM = fakeBPM;
-  bpm = fakeBPM;
-
-  // maintain beat history
-  static unsigned long lastBeatSim = 0;
-  if (now - lastBeatSim > (unsigned long)(60000.0f / fakeBPM)) {
-    lastBeatSim = now;
-    beatHistory[beatIndex] = fakeBPM;
-    beatIndex = (beatIndex + 1) % MAX_HISTORY;
-    if (beatIndex == 0) historyFull = true;
-    if (beatsCollected < MAX_HISTORY) beatsCollected++;
   }
 }
 
@@ -470,6 +407,7 @@ void handleTouchInput() {
 }
 
 void handleCalibration() {
+  server.handleClient();
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
@@ -741,7 +679,7 @@ void handleStepCounting() {
 
     display.setTextSize(1);
     display.setCursor(0, 55);
-    display.printf("HR: %d bpm", (int)bpmFiltered);
+    display.printf("HR: %d bpm", (int)HR_GetBPM());
     display.display();
   }
 }
@@ -988,17 +926,35 @@ void startWorkout() {
 }
 
 void handleWorkout() {
+  server.handleClient();
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-Serial.printf("%lu,%.2f,%.2f,%.2f\n", millis(), a.acceleration.x, a.acceleration.y, a.acceleration.z);
+  Serial.printf("%lu,%.2f,%.2f,%.2f\n", millis(), a.acceleration.x, a.acceleration.y, a.acceleration.z);
 
   bool repCompleted = false;
   ExerciseConfig currentEx = workout[currentExerciseIndex];
   unsigned long setDuration = (millis() - setStartTime) / 1000; // in seconds
 
-  // Reset peak HR at start of new exercise
-  if (currentRep == 0 && currentSet == 1)
-    peakWorkoutHR = 0;
+      static int lastSetSeen = -1;
+
+      if (currentSet != lastSetSeen) {
+        lastSetSeen = currentSet;
+
+        // Reset per-set HR features
+        peakWorkoutHR = 0;
+        bpmSum = 0;
+        bpmSamples = 0;
+        hrVarSum = 0;
+        hrVarSamples = 0;
+        prevHRForVar = -1;
+
+        // Reset rest-related capture flags
+        restBaselineCaptured = false;
+        recoveryCaptured = false;
+
+        Serial.printf("🔄 HR features reset for Set %d\n", currentSet);
+      }
+
 
   // Detect which exercise you're doing
   switch(currentEx.detectionType) {
@@ -1019,20 +975,26 @@ Serial.printf("%lu,%.2f,%.2f,%.2f\n", millis(), a.acceleration.x, a.acceleration
     // --- Measure how long the set took ---
     //unsigned long setDuration = (millis() - setStartTime) / 1000; // in seconds
 
-    // --- Map set duration to realistic HR peak ---
-   float mappedPeak = 110.0f + constrain(map(setDuration, 8, 45, 10, 60), 10, 60);
+    rpeFeatures.avg_bpm = bpmSum / max(1, bpmSamples);
+    rpeFeatures.peak_bpm = peakWorkoutHR;
+    rpeFeatures.hr_variability = (hrVarSamples > 0) ? (hrVarSum / hrVarSamples) : 0;
 
-    // Add an RPE-based boost (+5–20 bpm if RPE is high)
-    mappedPeak += (lastSetRPE - 5.0f) * 3.5f;
 
-    // Add small randomization for realism
-    mappedPeak += random(-5, 6);
+    // ================= SESSION LOAD INDEX =================
+    float durationMin = setDuration / 60.0f;
+    float intensity = rpeFeatures.avg_bpm / 190.0f;
 
-    // Cap to physiological max
-    mappedPeak = constrain(mappedPeak, 100.0f, 185.0f);
+    rpeFeatures.session_load_index = intensity * durationMin;
 
-    targetPeakHR = mappedPeak;
-    peakWorkoutHR = (int)targetPeakHR;
+    //reset rest flags
+    restBaselineCaptured = false;
+    recoveryCaptured = false;
+
+    Serial.printf("LoadIndex=%.3f | avgHR=%.1f | duration=%.1f min\n",
+      rpeFeatures.session_load_index,
+      rpeFeatures.avg_bpm,
+      durationMin);
+
 
     Serial.printf("Set duration: %lus | targetPeakHR=%.1f bpm\n", setDuration, targetPeakHR);
       currentSet++;
@@ -1064,58 +1026,34 @@ Serial.printf("%lu,%.2f,%.2f,%.2f\n", millis(), a.acceleration.x, a.acceleration
     }
   }
 
+  // ===== HR FEATURE ACCUMULATION (confidence-gated) =====
+  if (HR_GetConfidence() > 50) {
+    bpmSum += HR_GetBPM();
+    bpmSamples++;
+  }
+
+    // ===== HR VARIABILITY (confidence-gated) =====
+  if (HR_GetConfidence() > 50 && prevHRForVar >= 0) {
+    hrVarSum += abs(HR_GetBPM() - prevHRForVar);
+    hrVarSamples++;
+  }
+  prevHRForVar = HR_GetBPM();
+
+
+
   // Track highest HR reached during this set (for adaptive rest)
-  if ((int)bpmFiltered > peakWorkoutHR)
-    peakWorkoutHR = (int)bpmFiltered;
-
-  // --- Rule-based RPE estimation (realistic) ---
-    // --- Improved Rule-based RPE Estimation ---
-  float hrPct = (float)peakWorkoutHR / 190.0f * 100.0f;
-  float newRPE = 0.0f;
-
-  // Base RPE curve aligned with realistic HR zones
-  if      (hrPct < 60)  newRPE = 3.0f;   // very light (HR ~100-115)
-  else if (hrPct < 68)  newRPE = 4.5f;   // light (HR ~115-130)
-  else if (hrPct < 75)  newRPE = 5.8f;   // moderate (HR ~130-143)
-  else if (hrPct < 82)  newRPE = 6.8f;   // somewhat hard (HR ~143-156)
-  else if (hrPct < 88)  newRPE = 7.7f;   // hard (HR ~156-167)
-  else if (hrPct < 93)  newRPE = 8.5f;   // very hard (HR ~167-177)
-  else if (hrPct < 97)  newRPE = 9.2f;   // near-max (HR ~177-185)
-  else                  newRPE = 9.8f;   // maximal effort (HR >185)
-
-  // Smooth nonlinear scaling (matches HR curve better)
-  float effortCurve = pow((hrPct / 100.0f), 1.3f);
-  newRPE *= 0.75f + 0.5f * effortCurve;
-
-  // Set duration influence (longer sets = higher perceived effort)
-  float durationAdj = constrain(setDuration / 35.0f, 0.0f, 1.0f);
-  newRPE += durationAdj * 0.6f;
-
-  // Fatigue accumulation across sets (progressive overload feeling)
-  float fatigueAdj = 0.15f * (currentSet - 1);
-  newRPE += fatigueAdj;
-
-  // Realistic caps based on actual HR ranges
-  if (peakWorkoutHR < 130 && newRPE > 7.0f) newRPE = 6.5f;
-  if (peakWorkoutHR < 145 && newRPE > 8.0f) newRPE = 7.5f;
-  if (peakWorkoutHR >= 170 && newRPE < 8.5f) newRPE = 8.8f;
-  
-  newRPE = constrain(newRPE, 1.0f, 10.0f);
-
-  // Smooth transition (less aggressive to prevent oscillation)
-  lastSetRPE = 0.85f * lastSetRPE + 0.15f * newRPE;
+  if (HR_GetConfidence() > 60 && HR_GetBPM() > peakWorkoutHR)
+    peakWorkoutHR = HR_GetBPM();
 
 }
 
 void handleRest() {
+  server.handleClient();
   // --- Persistent state across frames ---
   static bool restActive = false;
-  static unsigned long restStartTime = 0;
   static unsigned long lastUpdate = 0;
   static bool warnedNearEnd = false;
   static int stableCounter = 0;
-  static float simulatedHR = 0.0f;
-  static float restBaseline = 0.0f;
   static float prevHR = 0.0f;
   static unsigned long entryDelayStart = 0;
 
@@ -1124,54 +1062,74 @@ void handleRest() {
   const unsigned long MAX_REST_DURATION = 90000; // 90s safety cutoff
   const float HR_RECOVERY_FACTOR = 0.65f;        // 65% of peak HR
   const float HR_STABILITY_DELTA = 2.5f;         // bpm considered stable
-  const int HR_STABILITY_FRAMES = 10;            // ~2.5s of stable HR
+  const int HR_STABILITY_FRAMES = 10;            // ~2.5s stable HR
   const unsigned long UPDATE_MS = 250;
-  const unsigned long ENTRY_DELAY_MS = 1000;     // prevent instant skip
+  const unsigned long ENTRY_DELAY_MS = 1000;
 
   // --- Adaptive rest time based on effort ---
   float rpeFactor = constrain(lastSetRPE, 5.0f, 10.0f);
   unsigned long MIN_REST_DURATION = BASE_MIN_REST;
-  if (rpeFactor >= 8.5f) MIN_REST_DURATION = 40000; // hard → 40 s
-  else if (rpeFactor <= 6.0f) MIN_REST_DURATION = 20000; // light → 20 s
+  if (rpeFactor >= 8.5f)      MIN_REST_DURATION = 40000;
+  else if (rpeFactor <= 6.0f) MIN_REST_DURATION = 20000;
 
-  // --- Reset all rest state fresh every time we enter RESTING ---
+  // --- Entering REST state ---
   if (!restActive) {
     restActive = true;
     warnedNearEnd = false;
     stableCounter = 0;
-    simulatedHR = bpmFiltered;
-    restBaseline = max(65.0f, float(peakWorkoutHR) * 0.55f);
-    prevHR = simulatedHR;
+    prevHR = HR_GetBPM();
     restStartTime = millis();
+    restBaselineCaptured = false;
+    recoveryCaptured = false;
     entryDelayStart = millis();
 
-    Serial.printf("🧘 NEW REST START | HR=%.1f | Peak=%.1f | Baseline=%.1f | RPE=%.1f | MinRest=%lus\n",
-                  bpmFiltered, float(peakWorkoutHR), restBaseline, lastSetRPE, MIN_REST_DURATION / 1000);
+    Serial.printf(
+      "🧘 REST START | HR=%.1f | Peak=%.1f | RPE=%.1f | MinRest=%lus\n",
+      HR_GetBPM(), float(peakWorkoutHR), lastSetRPE,
+      MIN_REST_DURATION / 1000
+    );
   }
 
-  // --- Compute elapsed time ---
-  unsigned long elapsedMs = millis() - restStartTime;
+  // --- Time tracking ---
+  unsigned long elapsedMs  = millis() - restStartTime;
   unsigned long elapsedSec = elapsedMs / 1000;
 
-  // --- Simulate HR decay smoothly ---
+  // --- Periodic update ---
   if (millis() - lastUpdate > UPDATE_MS) {
     lastUpdate = millis();
 
-    float t = constrain(elapsedMs / 8000.0f, 0.0f, 1.0f);
-    float easing = 1.0f - exp(-2.0f * t);
-    float targetHR = restBaseline + (peakWorkoutHR - restBaseline) * (1.0f - easing);
-    float noise = random(-5, 6) * 0.25f;
-    simulatedHR = 0.9f * simulatedHR + 0.1f * (targetHR + noise);
-    bpmFiltered = simulatedHR;
+    // ===== ML FEATURE CAPTURE =====
 
-    // Track HR stability
-    if (fabs(simulatedHR - prevHR) < HR_STABILITY_DELTA)
+    // Baseline HR after 10s (confidence-gated)
+    if (!restBaselineCaptured &&
+        elapsedMs > 10000 &&
+        HR_GetConfidence() > 50) {
+
+      rpeFeatures.min_bpm_rest = HR_GetBPM();
+      restBaselineCaptured = true;
+    }
+
+    // 30s HR recovery (confidence-gated)
+    if (!recoveryCaptured &&
+        elapsedMs > 30000 &&
+        HR_GetConfidence() > 50) {
+
+      rpeFeatures.hr_recovery_30s =
+        rpeFeatures.peak_bpm - HR_GetBPM();
+      recoveryCaptured = true;
+    }
+
+    // HR stability detection (confidence-gated)
+    if (HR_GetConfidence() > 50 &&
+        fabs(HR_GetBPM() - prevHR) < HR_STABILITY_DELTA) {
       stableCounter++;
-    else
+    } else {
       stableCounter = max(0, stableCounter - 1);
-    prevHR = simulatedHR;
+    }
 
-    // --- OLED Update ---
+    prevHR = HR_GetBPM();
+
+    // --- OLED ---
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
@@ -1180,7 +1138,7 @@ void handleRest() {
 
     display.setTextSize(2);
     display.setCursor(0, 12);
-    display.printf("HR: %.0f", bpmFiltered);
+    display.printf("HR: %.0f", HR_GetBPM());
 
     display.setTextSize(2);
     display.setCursor(0, 36);
@@ -1191,60 +1149,67 @@ void handleRest() {
     display.printf("%lus", elapsedSec);
 
     display.drawRect(0, 57, 128, 6, SSD1306_WHITE);
-    int barWidth = map(elapsedSec, 0, (MIN_REST_DURATION / 1000), 0, 128);
+    int barWidth = map(elapsedSec, 0,
+                       (MIN_REST_DURATION / 1000), 0, 128);
     barWidth = constrain(barWidth, 0, 128);
     display.fillRect(0, 57, barWidth, 6, SSD1306_WHITE);
     display.display();
 
-    // Warning near the end of rest
-    if (!warnedNearEnd && bpmFiltered <= 0.7f * peakWorkoutHR &&
+    // Warning near end
+    if (!warnedNearEnd &&
+        HR_GetBPM() <= 0.7f * peakWorkoutHR &&
         elapsedMs > (MIN_REST_DURATION / 2)) {
+
       tone(BUZZER_PIN, 2200, 120);
       delay(80);
       tone(BUZZER_PIN, 2500, 120);
       warnedNearEnd = true;
-      Serial.println("⚠️ Near recovery — prepare!");
     }
   }
 
-  // --- Safety delay to avoid instant skipping ---
-  if (millis() - entryDelayStart < ENTRY_DELAY_MS) return;
+  // --- Safety delay ---
+  if (millis() - entryDelayStart < ENTRY_DELAY_MS)
+    return;
 
-  // --- Transition conditions ---
-  bool timeMet = elapsedMs >= MIN_REST_DURATION;
-  bool hrRecovered = bpmFiltered <= HR_RECOVERY_FACTOR * peakWorkoutHR;
-  bool hrStable = stableCounter >= HR_STABILITY_FRAMES;
-  bool timeout = elapsedMs >= MAX_REST_DURATION;
+  // --- Exit conditions ---
+  bool timeMet     = elapsedMs >= MIN_REST_DURATION;
+  bool hrRecovered = HR_GetBPM() <= HR_RECOVERY_FACTOR * peakWorkoutHR;
+  bool hrStable    = stableCounter >= HR_STABILITY_FRAMES;
+  bool timeout     = elapsedMs >= MAX_REST_DURATION;
 
-  // --- Proceed only when conditions met ---
   if ((timeMet && hrRecovered && hrStable) || timeout) {
+
+    // ===== RECOVERY SLOPE =====
+    float restDurationSec = elapsedMs / 1000.0f;
+    rpeFeatures.recovery_slope =
+      (HR_GetBPM() - rpeFeatures.peak_bpm) / restDurationSec;
+
+    // ===== ML RPE =====
+    float mlRPE = runRPEModel();
+    lastSetRPE = 0.85f * lastSetRPE + 0.15f * mlRPE;
+
+    Serial.printf("🧠 ML RPE: %.2f | Smoothed: %.2f\n",
+                  mlRPE, lastSetRPE);
+
     tone(BUZZER_PIN, 2000, 150);
     delay(100);
     tone(BUZZER_PIN, 2500, 150);
     delay(100);
     tone(BUZZER_PIN, 3000, 250);
 
-    Serial.printf("✅ REST DONE | Duration=%lus | HR=%.1f bpm | Next set starting\n",
-                  elapsedSec, bpmFiltered);
-
-    // 🧹 Full reset for next rest phase
+    // --- Reset rest state ---
     restActive = false;
-    restStartTime = 0;
     lastUpdate = 0;
     warnedNearEnd = false;
     stableCounter = 0;
-    simulatedHR = 0.0f;
-    restBaseline = 0.0f;
     prevHR = 0.0f;
     entryDelayStart = 0;
 
-    // Transition back to working
     setStartTime = millis();
     workoutState = WORKING;
     updateDisplay();
   }
 }
-
 
 
 void updateDisplay() {
@@ -1722,5 +1687,135 @@ bool detectLateralRaise(sensors_event_t a, sensors_event_t g) {
   }
 
   return false;
+}
+
+
+void HR_Init() {
+  if (!hrSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("❌ MAX30102 not found");
+    while (1);
+  }
+
+  hrSensor.setup();
+  hrSensor.setPulseAmplitudeRed(0x7F);
+  hrSensor.setPulseAmplitudeIR(0x7F);
+  hrSensor.setPulseAmplitudeGreen(0);
+
+  hrSensor.setADCRange(4096);
+  hrSensor.setPulseWidth(411);
+  hrSensor.setSampleRate(50);
+
+  Serial.println("✅ Heart Rate sensor initialized");
+}
+
+
+void HR_Update() {
+  hrSensor.check();   //  REQUIRED
+
+  while (hrSensor.available()) {
+    long ir = hrSensor.getIR();
+
+    // Reject no-finger cases
+    if (ir < 50000) {
+      hrConfidence = 0;
+      hrSensor.nextSample();
+      continue;
+    }
+
+    if (checkForBeat(ir)) {
+      unsigned long now = millis();
+      unsigned long rr = now - hrLastBeat;
+      hrLastBeat = now;
+
+      if (rr > 300 && rr < 2000) { // 30–200 bpm
+        hrBPMInstant = 60.0f / (rr / 1000.0f);
+
+        hrRates[hrRateSpot++] = (byte)hrBPMInstant;
+        hrRateSpot %= HR_RATE_SIZE;
+
+        hrBPMAvg = 0;
+        for (byte i = 0; i < HR_RATE_SIZE; i++)
+          hrBPMAvg += hrRates[i];
+        hrBPMAvg /= HR_RATE_SIZE;
+
+        hrRR[hrRRIndex++] = rr;
+        if (hrRRIndex >= HR_RR_BUF) {
+          hrRRIndex = 0;
+          hrRRFilled = true;
+        }
+      }
+    }
+
+    hrSensor.nextSample(); // 🔴 REQUIRED
+  }
+
+  // ---- Confidence ----
+  if (hrRRFilled) {
+    float mean = 0;
+    for (int i = 0; i < HR_RR_BUF; i++) mean += hrRR[i];
+    mean /= HR_RR_BUF;
+
+    float var = 0;
+    for (int i = 0; i < HR_RR_BUF; i++) {
+      float d = hrRR[i] - mean;
+      var += d * d;
+    }
+    var /= HR_RR_BUF;
+
+    float stdDev = sqrt(var);
+    hrConfidence = constrain(100 - (stdDev / mean) * 100, 0, 100);
+  } else {
+    hrConfidence = 0;
+  }
+
+  // ---- Confidence gating ----
+  if (hrConfidence >= 70) {
+    hrBPMUsed = hrBPMAvg;
+    hrLastGoodBPM = hrBPMUsed;
+    hrBPMTrend = hrBPMUsed;
+  }
+  else if (hrConfidence >= 40) {
+    hrBPMTrend += 0.1f * (hrBPMAvg - hrBPMTrend);
+    hrBPMUsed = hrBPMTrend;
+  }
+  else {
+    hrBPMUsed = hrLastGoodBPM;
+  }
+}
+
+
+int HR_GetBPM() {
+  return hrBPMUsed;
+}
+
+int HR_GetConfidence() {
+  return hrConfidence;
+}
+
+
+
+float runRPEModel() {
+  float input[NUM_INPUTS] = {
+    rpeFeatures.avg_bpm,
+    rpeFeatures.peak_bpm,
+    rpeFeatures.min_bpm_rest,
+    rpeFeatures.hr_recovery_30s,
+    rpeFeatures.recovery_slope,
+    rpeFeatures.hr_variability,
+    rpeFeatures.session_load_index
+  };
+
+  for (int i = 0; i < NUM_INPUTS; i++) {
+    input[i] = (input[i] - scaler_mean[i]) / scaler_std[i];
+  }
+
+  if (!tf.predict(input).isOk()) {
+    Serial.println(tf.exception.toString());
+    return lastSetRPE;
+  }
+
+  float rpe = tf.outputs[0];   // ✅ regression output
+  rpe = constrain(rpe, 1.0f, 10.0f);
+  return rpe;
 }
 
