@@ -75,7 +75,7 @@ bool hrRRFilled = false;
 
 // ---- Gated BPM ----
 int hrBPMUsed = 0;
-int hrLastGoodBPM = 60;
+int hrLastGoodBPM = 0;
 float hrBPMTrend = 0;
 
 // ---- Confidence ----
@@ -407,7 +407,6 @@ void handleTouchInput() {
 }
 
 void handleCalibration() {
-  server.handleClient();
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
@@ -926,7 +925,6 @@ void startWorkout() {
 }
 
 void handleWorkout() {
-  server.handleClient();
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
   Serial.printf("%lu,%.2f,%.2f,%.2f\n", millis(), a.acceleration.x, a.acceleration.y, a.acceleration.z);
@@ -934,6 +932,24 @@ void handleWorkout() {
   bool repCompleted = false;
   ExerciseConfig currentEx = workout[currentExerciseIndex];
   unsigned long setDuration = (millis() - setStartTime) / 1000; // in seconds
+
+  // // Reset peak HR at start of new exercise
+  // static bool hrResetDone = false;
+
+  // if (currentRep == 0 && currentSet == 1 && !hrResetDone) {
+  //   peakWorkoutHR = 0;
+  //   bpmSum = 0;
+  //   bpmSamples = 0;
+  //   hrResetDone = true;
+  //   hrVarSum = 0;
+  //   hrVarSamples = 0;
+  //   prevHRForVar = -1;
+  // }
+
+  // // reset flag when exercise changes
+  // if (currentRep == 0 && currentSet > 1) {
+  //   hrResetDone = false;
+  // }
 
       static int lastSetSeen = -1;
 
@@ -1048,7 +1064,6 @@ void handleWorkout() {
 }
 
 void handleRest() {
-  server.handleClient();
   // --- Persistent state across frames ---
   static bool restActive = false;
   static unsigned long lastUpdate = 0;
@@ -1710,43 +1725,30 @@ void HR_Init() {
 
 
 void HR_Update() {
-  hrSensor.check();   //  REQUIRED
+  long ir = hrSensor.getIR();
 
-  while (hrSensor.available()) {
-    long ir = hrSensor.getIR();
+  if (checkForBeat(ir)) {
+    unsigned long now = millis();
+    unsigned long rr = now - hrLastBeat;
+    hrLastBeat = now;
 
-    // Reject no-finger cases
-    if (ir < 50000) {
-      hrConfidence = 0;
-      hrSensor.nextSample();
-      continue;
-    }
+    hrBPMInstant = 60.0f / (rr / 1000.0f);
 
-    if (checkForBeat(ir)) {
-      unsigned long now = millis();
-      unsigned long rr = now - hrLastBeat;
-      hrLastBeat = now;
+    if (hrBPMInstant > 20 && hrBPMInstant < 255) {
+      hrRates[hrRateSpot++] = (byte)hrBPMInstant;
+      hrRateSpot %= HR_RATE_SIZE;
 
-      if (rr > 300 && rr < 2000) { // 30–200 bpm
-        hrBPMInstant = 60.0f / (rr / 1000.0f);
+      hrBPMAvg = 0;
+      for (byte i = 0; i < HR_RATE_SIZE; i++)
+        hrBPMAvg += hrRates[i];
+      hrBPMAvg /= HR_RATE_SIZE;
 
-        hrRates[hrRateSpot++] = (byte)hrBPMInstant;
-        hrRateSpot %= HR_RATE_SIZE;
-
-        hrBPMAvg = 0;
-        for (byte i = 0; i < HR_RATE_SIZE; i++)
-          hrBPMAvg += hrRates[i];
-        hrBPMAvg /= HR_RATE_SIZE;
-
-        hrRR[hrRRIndex++] = rr;
-        if (hrRRIndex >= HR_RR_BUF) {
-          hrRRIndex = 0;
-          hrRRFilled = true;
-        }
+      hrRR[hrRRIndex++] = rr;
+      if (hrRRIndex >= HR_RR_BUF) {
+        hrRRIndex = 0;
+        hrRRFilled = true;
       }
     }
-
-    hrSensor.nextSample(); // 🔴 REQUIRED
   }
 
   // ---- Confidence ----
@@ -1783,7 +1785,6 @@ void HR_Update() {
   }
 }
 
-
 int HR_GetBPM() {
   return hrBPMUsed;
 }
@@ -1817,5 +1818,5 @@ float runRPEModel() {
   float rpe = tf.outputs[0];   // ✅ regression output
   rpe = constrain(rpe, 1.0f, 10.0f);
   return rpe;
-}
+}                
 
