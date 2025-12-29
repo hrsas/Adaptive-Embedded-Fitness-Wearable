@@ -68,3 +68,6 @@ The firmware follows a **state-machine-driven architecture**, ensuring determini
 
 **Harshvardhan Rajkumar**  
 Final Year B.Tech – Electronics & Computer Engineering
+
+**T S Nidish**
+Final Year B.Tech - Electronics & Computer Engineering
